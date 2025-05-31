@@ -722,7 +722,6 @@ class VarStreamDownSamplingBlock(nn.Module):
 
         return X_1, X_2
     
-    
 def main():
     """
     This is a simple test to check if the recomputation is correct
@@ -731,6 +730,9 @@ def main():
 
     The difference should be ~zero.
     """
+    import time
+    import deepspeed
+    from torch.utils.data import TensorDataset, DataLoader
 
     model = AsymmetricRevVit(
         block_type="swin-dw-mlp",
@@ -740,38 +742,22 @@ def main():
         n_head=1,
         stages=[2, 2, 18, 2],
         drop_path_rate=0.1,
-        patch_size=(
-            4,
-            4,
-        ),  
+        patch_size=(4, 4),  
         image_size=(224, 224),  
         num_classes=100,
     )
 
-    # random input, instaintiate and fixing.
-    # no need for GPU for unit test, runs fine on CPU.
+    # Basic model test with vanilla backward and custom backward
     x = torch.rand((1, 3, 224, 224))
-    model = model
     
-    # model = model.to("cuda")
-    # x = x.to("cuda")
-    import time
     start_time = time.time()          
-
-    # output of the model under reversible backward logic
     output = model(x)
-    # loss is just the norm of the output
     loss = output.norm(dim=1).mean()
-    print(loss.shape)
-
-    # computatin gradients with reversible backward logic
-    # using retain_graph=True to keep the computation graph.
+    print(f"Output shape: {output.shape}")
     loss.backward(retain_graph=True)
-
     end_time = time.time()
-
     print(f"Batch time: {(end_time - start_time) * 1000:.3f} ms") 
-
+    
     # gradient of the patchification layer under custom bwd logic
     rev_grad = model.patch_embed1.weight.grad.clone()
 
@@ -781,44 +767,82 @@ def main():
 
     # switching model mode to use vanilla backward logic
     model.no_custom_backward = True
-
-    # computing forward with the same input and model.
     output = model(x)
-    # same loss
-    loss = output.norm(dim=1)
-
-    # backward but with vanilla logic, does not need retain_graph=True
+    loss = output.norm(dim=1).mean()
     loss.backward()
-
-    # looking at the gradient of the patchification layer again
     vanilla_grad = model.patch_embed1.weight.grad.clone()
-
-    # difference between the two gradients is small enough.
-    # assert (rev_grad - vanilla_grad).abs().max() < 1e-6
-
+    
     print(f"\nNumber of model parameters: {sum(p.numel() for p in model.parameters())}\n")
-
+    
+    try:
+        # DeepSpeed profiling section
+        print("\nRunning DeepSpeed profiling...")
+        
+        # Create a small dataset with proper shapes
+        batch_size = 4
+        num_samples = 16
+        inputs = torch.rand((num_samples, 3, 224, 224))
+        targets = torch.randint(0, 100, (num_samples,))  # Class indices for 100 classes
+        
+        dataset = TensorDataset(inputs, targets)
+        train_dataloader = DataLoader(dataset, batch_size=batch_size)
+        
+        # DeepSpeed config
+        ds_config = {
+            "train_batch_size": batch_size,
+            "fp16": {"enabled": False},
+            "zero_optimization": {"stage": 0}
+        }
+        
+        # Initialize DeepSpeed with model
+        model_engine, optimizer, _, _ = deepspeed.initialize(
+            model=model,
+            model_parameters=model.parameters(),
+            config=ds_config
+        )
+        
+        # Set up the profiler
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./ds_trace'),
+            record_shapes=True,
+            with_stack=True
+        ) as prof:
+            for step, (batch_x, batch_y) in enumerate(train_dataloader):
+                if step >= 5:  # Limit to just a few steps
+                    break
+                    
+                # Forward pass
+                outputs = model_engine(batch_x)
+                loss = torch.nn.functional.cross_entropy(outputs, batch_y)
+                
+                # Backward and optimize
+                model_engine.backward(loss)
+                model_engine.step()
+                
+                prof.step()
+                print(f"Profiling step {step} completed")
+                
+        print("DeepSpeed profiling completed. Results saved to ./ds_trace")
+    except Exception as e:
+        print(f"DeepSpeed profiling failed: {e}")
+        
     try:
         from fvcore.nn import FlopCountAnalysis
         model.training = False
         input = torch.randn(1, 3, 224, 224)
         flops = FlopCountAnalysis(model, input)
-        # input = torch.randn(1, 3136, 192)
-        # part = model.layers[4].F
-        # flops = FlopCountAnalysis(part, input)
-        # print(f"\nNumber of model parameters: {sum(p.numel() for p in part.parameters())}\n")
         print(f"Total MACs Estimate (fvcore): {flops.total()}")
-    except:
-        print("FLOPs estimator failed")
-        pass
-    
+    except Exception as e:
+        print(f"FLOPs estimator failed: {e}")
+        
     try:
         from utils import log_model_source
         log_model_source(model)
-    except:
-        print("No logs created")
-        pass
-
+    except Exception as e:
+        print(f"Model logging failed: {e}")
 if __name__ == "__main__":
     main()
  
