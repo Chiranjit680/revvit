@@ -8,8 +8,10 @@ from torch.autograd import Function as Function
 from torch.nn import MultiheadAttention as MHA
 import sys
 import numpy as np
-
+import time
 from har_blocks import AsymmetricMHPAReversibleBlock, AsymmetricSwinReversibleBlock
+from torch.utils.data import DataLoader, TensorDataset
+import deepspeed
 
 def drop_path(x, drop_prob: float = 0.0, training: bool = False):
     """
@@ -721,18 +723,16 @@ class VarStreamDownSamplingBlock(nn.Module):
         X_1 = X_1.reshape(B, self.dim_out, -1).transpose(1, 2)
 
         return X_1, X_2
-    
+
+from utils import log_model_source  # Ensure this import is correctly implemented
+
 def main():
     """
     This is a simple test to check if the recomputation is correct
     by computing gradients of the first learnable parameters twice --
     once with the custom backward and once with the vanilla backward.
-
     The difference should be ~zero.
     """
-    import time
-    import deepspeed
-    from torch.utils.data import TensorDataset, DataLoader
 
     model = AsymmetricRevVit(
         block_type="swin-dw-mlp",
@@ -742,107 +742,111 @@ def main():
         n_head=1,
         stages=[2, 2, 18, 2],
         drop_path_rate=0.1,
-        patch_size=(4, 4),  
-        image_size=(224, 224),  
+        patch_size=(4, 4),
+        image_size=(224, 224),
         num_classes=100,
     )
 
-    # Basic model test with vanilla backward and custom backward
-    x = torch.rand((1, 3, 224, 224))
-    
-    start_time = time.time()          
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    x = torch.rand((1, 3, 224, 224), device=device)
+
+    # Vanilla forward + backward
+    start_time = time.time()
     output = model(x)
     loss = output.norm(dim=1).mean()
     print(f"Output shape: {output.shape}")
     loss.backward(retain_graph=True)
     end_time = time.time()
-    print(f"Batch time: {(end_time - start_time) * 1000:.3f} ms") 
-    
-    # gradient of the patchification layer under custom bwd logic
+    print(f"Batch time: {(end_time - start_time) * 1000:.3f} ms")
+
     rev_grad = model.patch_embed1.weight.grad.clone()
 
-    # resetting the computation graph
-    for param in model.parameters():
-        param.grad = None
+    # Reset gradients
+    model.zero_grad()
 
-    # switching model mode to use vanilla backward logic
-    model.no_custom_backward = True
+    # Run with vanilla autograd
+    model.no_custom_backward = True  # Ensure model uses PyTorch autograd
     output = model(x)
     loss = output.norm(dim=1).mean()
     loss.backward()
     vanilla_grad = model.patch_embed1.weight.grad.clone()
-    
-    print(f"\nNumber of model parameters: {sum(p.numel() for p in model.parameters())}\n")
-    
+
+    # Compare gradients
+    grad_diff = (rev_grad - vanilla_grad).abs().max().item()
+    print(f"\nMax gradient difference: {grad_diff:.6f}")
+    print(f"Number of model parameters: {sum(p.numel() for p in model.parameters())}\n")
+
+    # ======== DeepSpeed Profiling ========
     try:
-        # DeepSpeed profiling section
+        import deepspeed
         print("\nRunning DeepSpeed profiling...")
-        
-        # Create a small dataset with proper shapes
         batch_size = 4
         num_samples = 16
-        inputs = torch.rand((num_samples, 3, 224, 224))
-        targets = torch.randint(0, 100, (num_samples,))  # Class indices for 100 classes
-        
+        inputs = torch.rand((num_samples, 3, 224, 224), device=device)
+        targets = torch.randint(0, 100, (num_samples,), device=device)
         dataset = TensorDataset(inputs, targets)
         train_dataloader = DataLoader(dataset, batch_size=batch_size)
-        
-        # DeepSpeed config
+      
         ds_config = {
             "train_batch_size": batch_size,
             "fp16": {"enabled": False},
             "zero_optimization": {"stage": 0}
         }
-        
-        # Initialize DeepSpeed with model
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
         model_engine, optimizer, _, _ = deepspeed.initialize(
             model=model,
-            model_parameters=model.parameters(),
-            config=ds_config
+            optimizer=optimizer,
+            config_params=ds_config
         )
-        
-        # Set up the profiler
+
+        # Profiler setup
         with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA],
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA
+            ],
             schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
             on_trace_ready=torch.profiler.tensorboard_trace_handler('./ds_trace'),
             record_shapes=True,
             with_stack=True
         ) as prof:
             for step, (batch_x, batch_y) in enumerate(train_dataloader):
-                if step >= 5:  # Limit to just a few steps
+                if step >= 5:
                     break
-                    
-                # Forward pass
+                batch_x = batch_x.to(model_engine.device)
+                batch_y = batch_y.to(model_engine.device)
+                
                 outputs = model_engine(batch_x)
                 loss = torch.nn.functional.cross_entropy(outputs, batch_y)
                 
-                # Backward and optimize
+                backward_start = time.time()
                 model_engine.backward(loss)
                 model_engine.step()
+                backward_end = time.time()
                 
+                print(f"Step {step}: Backward pass time = {backward_end - backward_start:.4f}s")
                 prof.step()
-                print(f"Profiling step {step} completed")
-                
+
         print("DeepSpeed profiling completed. Results saved to ./ds_trace")
     except Exception as e:
         print(f"DeepSpeed profiling failed: {e}")
-        
+
+    # ======== FLOP Estimation ========
     try:
         from fvcore.nn import FlopCountAnalysis
-        model.training = False
-        input = torch.randn(1, 3, 224, 224)
-        flops = FlopCountAnalysis(model, input)
-        print(f"Total MACs Estimate (fvcore): {flops.total()}")
+        model.eval()  # Set to evaluation mode
+        flops = FlopCountAnalysis(model, x)
+        print(f"\nTotal MACs Estimate (fvcore): {flops.total() / 1e9:.2f} G")
     except Exception as e:
-        print(f"FLOPs estimator failed: {e}")
-        
+        print(f"FLOPs estimation failed: {e}")
+
+    # ======== Optional Logging ========
     try:
-        from utils import log_model_source
         log_model_source(model)
     except Exception as e:
         print(f"Model logging failed: {e}")
+
 if __name__ == "__main__":
     main()
- 
