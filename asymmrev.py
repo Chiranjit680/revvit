@@ -726,6 +726,7 @@ class VarStreamDownSamplingBlock(nn.Module):
 
 from utils import log_model_source  # Ensure this import is correctly implemented
 
+
 def main():
     """
     This is a simple test to check if the recomputation is correct
@@ -748,10 +749,12 @@ def main():
     )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     model.to(device)
     x = torch.rand((1, 3, 224, 224), device=device)
 
     # Vanilla forward + backward
+    print("Running forward pass with custom backward...")
     start_time = time.time()
     output = model(x)
     loss = output.norm(dim=1).mean()
@@ -766,6 +769,7 @@ def main():
     model.zero_grad()
 
     # Run with vanilla autograd
+    print("Running forward pass with vanilla autograd...")
     model.no_custom_backward = True  # Ensure model uses PyTorch autograd
     output = model(x)
     loss = output.norm(dim=1).mean()
@@ -830,6 +834,8 @@ def main():
                 prof.step()
 
         print("DeepSpeed profiling completed. Results saved to ./ds_trace")
+    except ImportError:
+        print("DeepSpeed not available. Skipping DeepSpeed profiling.")
     except Exception as e:
         print(f"DeepSpeed profiling failed: {e}")
 
@@ -839,14 +845,36 @@ def main():
         model.eval()  # Set to evaluation mode
         flops = FlopCountAnalysis(model, x)
         print(f"\nTotal MACs Estimate (fvcore): {flops.total() / 1e9:.2f} G")
+    except ImportError:
+        print("fvcore not available. Skipping FLOP estimation.")
+        print("Install with: pip install fvcore")
     except Exception as e:
         print(f"FLOPs estimation failed: {e}")
+
+    # ======== Alternative FLOP Estimation with torchinfo ========
+    try:
+        from torchinfo import summary
+        print("\nModel summary with torchinfo:")
+        summary(model, input_size=(1, 3, 224, 224), device=device)
+    except ImportError:
+        print("torchinfo not available. Install with: pip install torchinfo")
+    except Exception as e:
+        print(f"torchinfo summary failed: {e}")
+
+    # ======== Memory Usage Analysis ========
+    if torch.cuda.is_available():
+        print(f"\nGPU Memory Usage:")
+        print(f"Allocated: {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB")
+        print(f"Cached: {torch.cuda.memory_reserved(device) / 1024**2:.2f} MB")
+        print(f"Max Allocated: {torch.cuda.max_memory_allocated(device) / 1024**2:.2f} MB")
 
     # ======== Optional Logging ========
     try:
         log_model_source(model)
     except Exception as e:
         print(f"Model logging failed: {e}")
+
+    print("\nTest completed successfully!")
 
 if __name__ == "__main__":
     main()
