@@ -36,21 +36,18 @@ class AsymmetricRevVit(nn.Module):
         n_head=8,
         stages=[3, 3, 6, 3],
         drop_path_rate=0,
-        patch_size=(
-            2,
-            2,
-        ),  
+        patch_size=(2, 2),  
         image_size=(32, 32),  # CIFAR-10 image size
         num_classes=10,
         enable_amp=False,
-        layers_outputs=[],
     ):
         super().__init__()
 
         self.const_dim = const_dim
         self.n_head = n_head
         self.patch_size = patch_size
-
+        self.layers_outputs = []  # Initialize as empty list
+        
         self.const_num_patches = (image_size[0] // self.patch_size[0]) * (
             image_size[1] // self.patch_size[1]
         )
@@ -66,19 +63,7 @@ class AsymmetricRevVit(nn.Module):
 
         dpr = [
             x.item() for x in torch.linspace(0, drop_path_rate, sum(stages))
-        ] # stochastic depth decay rule
-
-        # R = []
-        # var_patches_shape = []
-        # self.var_dim = []
-        # const_var_token_ratio = []
-        # for i in range(len(stages)):
-        #     for _ in range(stages[i]):
-        #         R.append(sra_R[i])
-        #         var_patches_shape.append((const_patches_shape[0] // 2**i, const_patches_shape[1] // 2**i))
-        #         self.var_dim.append(var_dim[i])
-        #         const_var_token_ratio.append(2**(2*i))
-                
+        ]  # stochastic depth decay rule
 
         assert const_patches_shape[0] % 2**(len(stages)-1) == 0
         assert const_patches_shape[1] % 2**(len(stages)-1) == 0
@@ -91,12 +76,12 @@ class AsymmetricRevVit(nn.Module):
                 self.layers.append(
                     AsymmetricReversibleBlock(
                         dim_c=self.const_dim,
-                        dim_v=var_dim[stage_index], # Same dim_v used for all blocks in a stage
+                        dim_v=var_dim[stage_index],
                         num_heads=self.n_head,
                         enable_amp=enable_amp,
-                        sr_ratio=sra_R[stage_index], # Same sr_ratio used for all blocks in a stage
-                        token_map_pool_size=2**stage_index, # Same N_c : N_v ratio used for all blocks in a stage
-                        drop_path=dpr[i],                   # Drop path rate depends on block #, not stage #
+                        sr_ratio=sra_R[stage_index],
+                        token_map_pool_size=2**stage_index,
+                        drop_path=dpr[i],
                         const_patches_shape=const_patches_shape,
                         block_id=i
                     )
@@ -105,12 +90,12 @@ class AsymmetricRevVit(nn.Module):
                 self.layers.append(
                     AsymmetricMHPAReversibleBlock(
                         dim_c=self.const_dim,
-                        dim_v=var_dim[stage_index], # Same dim_v used for all blocks in a stage
+                        dim_v=var_dim[stage_index],
                         num_heads=(2**stage_index),
                         enable_amp=enable_amp,
-                        kv_pool_size=4,                     # K, V are fixed 14x14, created by pooling conv on 56x56
-                        token_map_pool_size=2**stage_index, # Same N_c : N_v ratio used for all blocks in a stage
-                        drop_path=dpr[i],                   # Drop path rate depends on block #, not stage #
+                        kv_pool_size=4,
+                        token_map_pool_size=2**stage_index,
+                        drop_path=dpr[i],
                         const_patches_shape=const_patches_shape,
                         block_id=i
                     )
@@ -120,40 +105,35 @@ class AsymmetricRevVit(nn.Module):
                     AsymmetricSwinReversibleBlock(
                         f_block=block_type,
                         dim_c=self.const_dim,
-                        dim_v=var_dim[stage_index], # Same dim_v used for all blocks in a stage
+                        dim_v=var_dim[stage_index],
                         num_heads=3*(2**stage_index),
-                        window_size=(8 if block_type=="swin-dw-mlp" else 7), # Fixed Window size 
+                        window_size=(8 if block_type=="swin-dw-mlp" else 7),
                         shift_size=(0 if (i % 2 == 0) else (8 if block_type=="swin-dw-mlp" else 7) // 2),
                         enable_amp=enable_amp,
-                        token_map_pool_size=2**stage_index, # Same N_c : N_v ratio used for all blocks in a stage
-                        drop_path=dpr[i],                   # Drop path rate depends on block #, not stage #
+                        token_map_pool_size=2**stage_index,
+                        drop_path=dpr[i],
                         const_patches_shape=const_patches_shape,
                         block_id=i
-                        
                     )
                 )
             else:
-                print("Invalid asymm block type")
-                quit()
+                raise ValueError(f"Invalid asymmetric block type: {block_type}")
             
             # Stage transitions
             if (i == np.cumsum(stages)[stage_index] - 1) and (stage_index != len(stages) - 1):
                 self.layers.append(
                     VarStreamDownSamplingBlock(
-                        input_patches_shape=(const_patches_shape[0] // 2**stage_index, const_patches_shape[1] // 2**stage_index),
+                        input_patches_shape=(const_patches_shape[0] // 2**stage_index, 
+                                           const_patches_shape[1] // 2**stage_index),
                         kernel_size=2, 
                         dim_in=var_dim[stage_index], 
                         dim_out=var_dim[stage_index+1]
                     )
                 )
 
-        # Reversible blocks can be treated same as vanilla blocks,
-        # any special treatment needed for reversible bacpropagation
-        # is contrained inside the block code and not exposed.
         self.layers = nn.ModuleList(self.layers)
 
-        # Boolean to switch between vanilla backprop and
-        # rev backprop. See, ``--vanilla_bp`` flag in main.py
+        # Boolean to switch between vanilla backprop and rev backprop
         self.no_custom_backward = False
 
         # Standard Patchification and absolute positional embeddings as in ViT
@@ -173,14 +153,9 @@ class AsymmetricRevVit(nn.Module):
             torch.zeros(1, self.const_num_patches, var_dim[0])
         )
 
-        # The two streams are concatenated and passed through a linear
-        # layer for final projection. This is the only part of RevViT
-        # that uses different parameters/FLOPs than a standard ViT model.
-        # Note that fusion can be done in several ways, including
-        # more expressive methods like in paper, but we use
-        # linear layer + LN for simplicity.
-        self.head = nn.Linear(self.const_dim, num_classes, bias=True) # Class Prediction using Const Stream
-        self.norm = nn.LayerNorm(self.const_dim) # Class Prediction using Const Stream
+        # Classification head using constant stream
+        self.head = nn.Linear(self.const_dim, num_classes, bias=True)
+        self.norm = nn.LayerNorm(self.const_dim)
 
     @staticmethod
     def vanilla_backward(x1, x2, layers):
@@ -188,25 +163,22 @@ class AsymmetricRevVit(nn.Module):
         Using rev layers without rev backpropagation. Debugging purposes only.
         Activated with self.no_custom_backward.
         """
-
         for _, layer in enumerate(layers):
             x1, x2 = layer(x1, x2)
-
         return x1, x2
 
     def forward(self, x):
-        # patchification using conv and flattening
-        # + abolsute positional embeddings
+        # Clear previous outputs at the start of each forward pass
+        self.layers_outputs = []
+        
+        # Patchification using conv and flattening + absolute positional embeddings
         x2 = self.patch_embed2(x).flatten(2).transpose(1, 2)
         x2 += self.pos_embeddings2
 
         x1 = self.patch_embed1(x).flatten(2).transpose(1, 2)
         x1 += self.pos_embeddings1
 
-        # the two streams X_1 and X_2 are initialized identically with x and
-        # concatenated along the last dimension to pass into the reversible blocks
-        # x = torch.cat([x1, x], dim=-1)
-
+        # Create segments for reversible computation
         reversible_segments = [[0]]
         
         for i in range(len(self.layers)):
@@ -216,32 +188,33 @@ class AsymmetricRevVit(nn.Module):
         reversible_segments[-1].append(len(self.layers))
 
         for segment in reversible_segments:
-
-            # no need for custom backprop in eval/inference phase
+            # No need for custom backprop in eval/inference phase
             if not self.training or self.no_custom_backward:
                 executing_fn = AsymmetricRevVit.vanilla_backward
             else:
                 executing_fn = RevBackProp.apply
 
-            # This takes care of switching between vanilla backprop and rev backprop
+            # Switch between vanilla backprop and rev backprop
             x1, x2 = executing_fn(
                 x1, x2,
                 self.layers[segment[0]:segment[1]],
             )
 
+            # Apply downsampling layer if exists
             if segment[1] != len(self.layers):
                 x1, x2 = self.layers[segment[1]](x1, x2)
-            layers_outputs.append(x2)
-        # aggregate across sequence length
-        pred = x2.mean(1) # Class Prediction using Const Stream
+            
+            self.layers_outputs.append(x2.clone())
 
-        # head pre-norm
+        # Aggregate across sequence length (global average pooling)
+        pred = x2.mean(1)
+
+        # Head pre-norm
         pred = self.norm(pred)
 
-        # pre-softmax logits
+        # Pre-softmax logits
         pred = self.head(pred)
 
-        # return pre-softmax logits
         return pred
 
 
