@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-
+import torch.nn.functional as F
 # Needed to implement custom backward pass
 from torch.autograd import Function as Function
 
@@ -669,6 +669,72 @@ class TokenMixerFBlockC2V(nn.Module):
             x = self.token_mixer(x).transpose(1, 2)
 
             return x
+
+class build_segmentation_model(nn.Module):
+    
+    def __init__(self, num_classes):
+        super(build_segmentation_model, self).__init__()
+        self.num_classes = num_classes
+        
+        # Initialize the backbone model
+        self.model = AsymmetricRevVit(
+            block_type="swin-dw-mlp",
+            const_dim=96,
+            var_dim=[96, 192, 384, 768],
+            sra_R=[8, 4, 2, 1],
+            n_head=1,
+            stages=[2, 2, 18, 2],
+            drop_path_rate=0.1,
+            patch_size=(4, 4),
+            image_size=(224, 224),
+            num_classes=num_classes,
+        )
+        
+        # Final 1x1 convolution for per-pixel classification
+        self.final_conv = nn.Conv2d(
+            in_channels=96,  # const_dim from backbone
+            out_channels=num_classes,
+            kernel_size=1
+        )
+
+    def forward(self, x):
+        # Get classification output and intermediate features
+        classification_output = self.model(x)
+        intermediate_features = self.model.layers_outputs
+        
+        # Use the intermediate features for segmentation
+        if intermediate_features and len(intermediate_features) > 0:
+            # Add all intermediate features
+            added_feature = torch.zeros_like(intermediate_features[0])
+            for feature in intermediate_features:
+                added_feature = added_feature + feature
+            
+            # Reshape from [B, N, C] to [B, C, H, W] for conv operations
+            B, N, C = added_feature.shape
+            H = W = int(N ** 0.5)  # Assuming square patches
+            
+            # Reshape to spatial format
+            feature_map = added_feature.transpose(1, 2).reshape(B, C, H, W)
+            
+            # Apply final 1x1 convolution
+            class_logits = self.final_conv(feature_map)
+            
+            # 4x bilinear upsampling to original image resolution (224x224)
+            upsampled_logits = F.interpolate(
+                class_logits, 
+                scale_factor=4, 
+                mode='bilinear', 
+                align_corners=False
+            )
+            
+            # Apply softmax to generate per-pixel class labels
+            segmentation_output = F.softmax(upsampled_logits, dim=1)
+            
+            return segmentation_output
+        
+        else:
+            # Fallback if no intermediate features available
+            return torch.zeros(x.size(0), self.num_classes, 224, 224, device=x.device)
         
 
 class VarStreamDownSamplingBlock(nn.Module):
@@ -699,48 +765,10 @@ class VarStreamDownSamplingBlock(nn.Module):
         X_1 = X_1.reshape(B, self.dim_out, -1).transpose(1, 2)
 
         return X_1, X_2
-    
-class build_segmentation_model(nn.Module):
-    
-    def __init__(self, num_classes):
-        super(build_segmentation_model, self).__init__()
-        self.layers_outputs = [],
-        self.num_classes = num_classes
-        self.model = AsymmetricRevVit(
-            block_type="swin-dw-mlp",
-            const_dim=96,
-            var_dim=[96, 192, 384, 768],
-            sra_R=[8, 4, 2, 1],
-            n_head=1,
-            stages=[2, 2, 18, 2],
-            drop_path_rate=0.1,
-            patch_size=(4, 4),
-            image_size=(224, 224),
-            num_classes=num_classes,
-            layers_outputs=self.layers_outputs,
-        )
-
-    def forward(self, x):
-        output = self.model(x)
-        self.layers_outputs.append(output)
-        added_output = torch.zeros_like(output)
-        for layer_output in self.layers_outputs:
-            layer_output.requires_grad = True
-            added_output += layer_output
-        conv_layer = nn.Conv2d(
-            in_channels=added_output.shape[1],
-            out_channels=added_output.shape[1],
-            kernel_size=1,
-            stride=1,
-        )
-        conv_output = conv_layer(added_output.unsqueeze(-1).unsqueeze(-1))
-        class_label_layer= nn.Linear(
-            in_features=conv_output.shape[1],
-            out_features=self.num_classes,
-        )
-        segmentation_output = class_label_layer(conv_output.squeeze(-1).squeeze(-1))
-        return segmentation_output
-        
+import torch
+import time
+# Make sure to import your segmentation model
+# from your_model_file import build_segmentation_model
 
 def main():
     """
@@ -754,27 +782,23 @@ def main():
     model = build_segmentation_model(
         num_classes=100
     )
-     
-        
-    
 
-    # random input, instaintiate and fixing.
+    # random input, instantiate and fixing.
     # no need for GPU for unit test, runs fine on CPU.
     x = torch.rand((1, 3, 224, 224))
     model = model
     
     # model = model.to("cuda")
     # x = x.to("cuda")
-    import time
     start_time = time.time()          
 
     # output of the model under reversible backward logic
     output = model(x)
     # loss is just the norm of the output
-    loss = output.norm(dim=1).mean()
+    loss = output.norm(dim=1).mean()  # Keep .mean() here
     print(loss.shape)
 
-    # computatin gradients with reversible backward logic
+    # computation gradients with reversible backward logic
     # using retain_graph=True to keep the computation graph.
     loss.backward(retain_graph=True)
 
@@ -783,27 +807,28 @@ def main():
     print(f"Batch time: {(end_time - start_time) * 1000:.3f} ms") 
 
     # gradient of the patchification layer under custom bwd logic
-    rev_grad = model.patch_embed1.weight.grad.clone()
+    rev_grad = model.model.patch_embed1.weight.grad.clone()  # CORRECT: model.model.patch_embed1
 
     # resetting the computation graph
     for param in model.parameters():
         param.grad = None
 
     # switching model mode to use vanilla backward logic
-    model.no_custom_backward = True
+    model.model.no_custom_backward = True  # Apply to the backbone model
 
     # computing forward with the same input and model.
     output = model(x)
-    # same loss
-    loss = output.norm(dim=1)
+    # same loss - MAKE SURE TO USE .mean() HERE TOO
+    loss = output.norm(dim=1).mean()  # ADD .mean() for consistency
 
     # backward but with vanilla logic, does not need retain_graph=True
     loss.backward()
 
     # looking at the gradient of the patchification layer again
-    vanilla_grad = model.patch_embed1.weight.grad.clone()
+    vanilla_grad = model.model.patch_embed1.weight.grad.clone()  # CORRECT: model.model.patch_embed1
 
     # difference between the two gradients is small enough.
+    print(f"Gradient difference: {(rev_grad - vanilla_grad).abs().max()}")
     # assert (rev_grad - vanilla_grad).abs().max() < 1e-6
 
     print(f"\nNumber of model parameters: {sum(p.numel() for p in model.parameters())}\n")
@@ -813,10 +838,6 @@ def main():
         model.training = False
         input = torch.randn(1, 3, 224, 224)
         flops = FlopCountAnalysis(model, input)
-        # input = torch.randn(1, 3136, 192)
-        # part = model.layers[4].F
-        # flops = FlopCountAnalysis(part, input)
-        # print(f"\nNumber of model parameters: {sum(p.numel() for p in part.parameters())}\n")
         print(f"Total MACs Estimate (fvcore): {flops.total()}")
     except:
         print("FLOPs estimator failed")
@@ -831,4 +852,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
