@@ -2,7 +2,7 @@ from rev import *
 from fast_rev import *
 from vit import *
 # from revseg import HierarchicalRevVit, OnlyMLPRevViT
-from asymmrev import AsymmetricRevVit
+from asymmrev import AsymmetricRevVit, build_segmentation_model
 
 from utils import log_model_source, save_macs_params_count
 
@@ -88,6 +88,11 @@ def build_model(args):
             num_classes=args.num_classes,
             enable_amp=args.amp,
         )
+    elif args.model == "revvit-segmentation":
+        model = build_segmentation_model(
+            num_classes=150)
+            
+        
     else:
         raise NotImplementedError(f"Model {args.model} not supported.")
     
